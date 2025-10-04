@@ -1,0 +1,21 @@
+# TimesFM Core Dependencies
+numpy>=1.26.4
+torch>=2.0.0
+huggingface_hub>=0.23.0
+safetensors>=0.5.3
+
+# Covariates Support (for forecast_with_covariates)
+jax>=0.4.0
+jaxlib>=0.4.0
+scikit-learn>=1.0.0
+
+# Data Analysis and Visualization
+pandas>=2.0.0
+seaborn>=0.13.0
+matplotlib>=3.8.0
+
+# Jupyter Support
+jupyter>=1.0.0
+ipykernel>=6.0.0
+ipywidgets>=8.0.0
+

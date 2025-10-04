@@ -1,8 +1,81 @@
-.venv/
-dist/
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Model checkpoints and cache
+*.pth
+*.pt
+*.ckpt
 checkpoints/
-wandb/
-datasets/
-results/
-timesfm_jax.egg-info/
+
+# Hugging Face cache
+.cache/
+~/.cache/huggingface/
+
+# Logs
+logs/
+*.log
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# Spec story (if not needed in repo)
+.specstory/
