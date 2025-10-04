@@ -14,6 +14,10 @@ pandas>=2.0.0
 seaborn>=0.13.0
 matplotlib>=3.8.0
 
+# Benchmark Forecasting Methods
+statsmodels>=0.14.0
+tbats>=1.1.0
+
 # Jupyter Support
 jupyter>=1.0.0
 ipykernel>=6.0.0

@@ -24,10 +24,13 @@ jaxlib = { version = ">=0.4.0", optional = true }
 scikit-learn = { version = ">=1.0.0", optional = true }
 pandas = { version = ">=2.0.0", optional = true }
 seaborn = { version = ">=0.13.0", optional = true }
+statsmodels = { version = ">=0.14.0", optional = true }
+tbats = { version = ">=1.1.0", optional = true }
 
 [tool.poetry.extras]
 covariates = ["jax", "jaxlib", "scikit-learn"]
 analysis = ["pandas", "seaborn"]
+benchmarks = ["statsmodels", "tbats"]
 
 [tool.ruff]
 line-length = 88
