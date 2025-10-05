@@ -305,8 +305,8 @@ We provide two ready-to-use notebooks demonstrating TimesFM 2.5 quantile forecas
 ### 2. `notebooks/vn2_submission_quantile.ipynb`
 **Production-ready VN2 submission:**
 - All 599 SKUs
-- VN2 cost structure (Cu=$1.0, Co=$0.2)
-- Critical fractile calculation (0.833 → P80)
+- VN2 cost structure (Cu=$1.0, Co=$0.2/week, L+R=3 weeks)
+- Critical fractile calculation (0.625 → ~P60–P70)
 - 3-week protection period aggregation
 - Base-stock policy integration
 - Generates `orders_timesfm_quantile_demo.csv`
