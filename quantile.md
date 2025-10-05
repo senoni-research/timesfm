@@ -6,6 +6,11 @@ TimesFM 2.5 is a pretrained time-series foundation model (200M parameters) from 
 
 This capability is especially relevant for inventory planning challenges like VN2, where short-horizon demand forecasts feed into ordering decisions that must balance shortage vs. holding costs. In inventory planning, uncertainty matters as much as accuracy – an under-forecast can lead to stockouts (lost sales), while over-forecasting ties up capital in excess stock.
 
+Background pointers for readers:
+- The quantile head is an additional ~30M parameter component that can produce continuous quantile forecasts over long horizons (up to ~1,000 steps) on top of the base decoder-only model.
+- The intent is production‑readiness: optimize not just the point estimate but the full predictive distribution used by downstream policies.
+- TimesFM is available open-source and also as a managed option (e.g., cloud‑hosted) for easier operationalization.
+
 ## Why Quantile Forecasts Improve Inventory Decisions
 
 Traditional inventory planning often relies on a single forecast (mean or median) plus ad-hoc buffers (safety stock). This approach can be myopic because it doesn't explicitly account for the full demand uncertainty. Quantile forecasts, by contrast, directly target different probability levels of demand, which can be aligned to business service goals and cost preferences.
@@ -20,9 +25,14 @@ In service-oriented supply chains, planners specify a target service level (e.g.
 
 **Example from our implementation** (`quantile_inventory_demo.ipynb`):
 ```python
-# P90 policy achieves ~90% service
-q90 = quantile_forecast[:, :, 9]  # 90th percentile
-service_achieved = np.mean(q90 >= actuals) * 100  # ~90%
+# P90 policy should target ~90% cycle service; verify via calibration
+q90 = quantile_forecast[:, :, 9]   # 90th percentile
+
+# Per-SKU protection-period coverage (sum across horizon)
+service_achieved = np.mean(q90.sum(axis=1) >= actuals.sum(axis=1)) * 100
+
+# Also track per-timestep coverage for diagnostics if needed:
+# per_timestep = np.mean(q90 >= actuals) * 100
 ```
 
 ### 2. Data-Driven Safety Stock Calculation
@@ -56,22 +66,39 @@ Where:
 **VN2 Example:**
 - Shortage cost (Cu): $1.00 per unit
 - Holding cost (Co): $0.20 per unit per week
-- Critical fractile: 1.0 / (1.0 + 0.2) = **0.8333**
-- **Optimal policy: Use P80 quantile**
+- Protection period (L+R): 3 weeks
+- Holding cost (period basis): Co_period = 0.20 × 3 = **$0.60**
+- Critical fractile: 1.0 / (1.0 + 0.6) = **0.625** (≈ P63)
+- **Target τ ≈ 0.625 (P63). With P10…P90 grids, round to the closest available quantile (P60 or P70).**
+
+**Note:** Both costs must be on the same time basis (protection period = lead time + review period).
 
 **From our VN2 submission** (`vn2_submission_quantile.ipynb`):
 ```python
-# Map critical fractile to closest quantile
-CRITICAL_RATIO = SHORTAGE_COST / (SHORTAGE_COST + HOLDING_COST)  # 0.8333
+# Convert holding cost to protection-period basis
+Co_period = HOLDING_COST * PROTECTION_WEEKS  # $0.20/week × 3 weeks = $0.60
+CRITICAL_RATIO = SHORTAGE_COST / (SHORTAGE_COST + Co_period)  # 0.625
 quantile_levels = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
 closest_idx = np.argmin(np.abs(quantile_levels - CRITICAL_RATIO))
-chosen_quantile = quantile_levels[closest_idx]  # P80
+chosen_quantile = quantile_levels[closest_idx]  # P60 or P70 (nearest to τ*)
 
-# Use P80 forecast as order quantity
+# Use chosen quantile forecast as order quantity
 optimal_forecast = quantile_forecast[:, :, closest_idx + 1]
 ```
 
 This approach inherently accounts for the fact that being wrong on the high side is less costly than being wrong on the low side, which a point forecast alone cannot capture.
+
+Quick planner guide (grid P10…P90):
+
+| Cost ratio Cu:Co | Critical fractile τ | Practical quantile |
+|---|---:|---|
+| 1 : 1 | 0.50 | P50 |
+| 2 : 1 | 0.67 | ~P70 |
+| 4 : 1 | 0.80 | ~P80 |
+| 5 : 1 | 0.83 | ~P80–P90 |
+| 9 : 1 | 0.90 | P90 |
+
+**Note:** Cost ratios must be on the same time basis (protection period, not per week).
 
 ## Implementation Guide
 
@@ -126,6 +153,14 @@ point_forecast, quantile_forecast = model.forecast(
 #   Index 1-9: P10, P20, P30, P40, P50, P60, P70, P80, P90
 ```
 
+```python
+assert quantile_forecast.shape[-1] == 10  # [mean, P10..P90]
+```
+
+If you need a non‑default percentile (e.g., P95), two practical options:
+- Interpolate between the nearest modeled quantiles (e.g., between P90 and P80) under a reasonable shape assumption.
+- If using the continuous quantile head, query an arbitrary τ directly (API‑dependent) to obtain the desired percentile.
+
 ### Step 3: Select Policy-Appropriate Quantile
 
 **Service-Level Policy:**
@@ -147,6 +182,13 @@ optimal_quantile = quantile_forecast[:, :, closest_idx + 1]
 order_qty = optimal_quantile.sum(axis=1)
 ```
 
+Protection‑period aggregation note:
+- Simple and robust: sum per‑week Pτ across the protection period (our demo choice).
+- More coherent (if you model week‑to‑week dependence): estimate the protection‑period distribution first, then take its τ‑quantile directly.
+ - Summing weekly quantiles can slightly underestimate tail risk when weeks are positively correlated; for high‑stakes items, simulate the period distribution and take its τ‑quantile.
+
+Terminology: Protection period = lead time (L) + review period (R). In VN2 demos we used L+R = 3 weeks.
+
 ### Step 4: Integrate with Base-Stock Policy
 
 **From our VN2 submission:**
@@ -156,7 +198,8 @@ from vn2inventory.policy import compute_orders
 # Prepare demand statistics
 demand_stats = pd.DataFrame({
     'mean_demand': optimal_quantile.sum(axis=1),  # 3-week demand
-    'std_demand': (q80 - q50).sum(axis=1) / 0.84,  # Estimate from IQR
+    'std_demand': (q80 - q50).sum(axis=1) / 0.8416,  # Normal approx: P80-P50 ≈ 0.8416σ
+    # Alternative: (q90 - q10).sum(axis=1) / 2.5632  # More robust
 })
 
 # Compute orders
@@ -193,6 +236,13 @@ def check_calibration(actuals, quantile_forecasts, quantile_levels):
 # P90: target=0.90, empirical=0.89, error=-0.01 ✓ Well calibrated!
 ```
 
+Calibration guidance:
+- Aim for small absolute coverage error: ≤5% is excellent, ≤10% is good on a held‑out window.
+- If under‑coverage persists, use a slightly higher operational quantile (e.g., deploy P85 for a nominal 80% target) or add a small uplift.
+- Re‑check calibration when portfolio mix or lead times change; censoring/intermittency can shift empirical coverage.
+
+Note on censoring (VN2): if availability is zero, observed sales are stock‑censored and not true demand. Treat censored weeks accordingly (e.g., demand‑unconstraining or include availability as a covariate) when assessing coverage.
+
 ## Quantile Forecasts vs. Point Forecasts
 
 ### Decision-Optimality vs. Accuracy
@@ -219,6 +269,10 @@ TimesFM's quantile output is **non-parametric** and learned from data, which bet
 - Intermittent demand (many zeros)
 - Fat-tailed demand (rare spikes)
 
+Complementary rails for practice:
+- A simple seasonal moving‑average baseline often exhibits low mean bias; it can serve as a guardrail when stockout penalties are extreme.
+- Blended strategies are common (e.g., use P50 as baseline and apply a seasonal bump in known peaks) to improve robustness and stakeholder trust.
+
 ### When to Use Point Forecasts
 
 Not every decision requires full distributions. Point forecasts are still essential for:
@@ -227,6 +281,11 @@ Not every decision requires full distributions. Point forecasts are still essent
 - Competition metrics (MAPE/WMAPE)
 
 TimesFM conveniently provides both in one go. One strategy: use the point forecast for baseline planning and quantiles for stress-testing or policy buffers.
+
+Practical rule of thumb:
+- Use **P50** for reporting/targets
+- Use **Pτ** for operations, where τ comes from service or cost
+- Keep a seasonal MA rail as a sanity guard
 
 ## Practical Notebooks
 
@@ -274,6 +333,11 @@ We provide two ready-to-use notebooks demonstrating TimesFM 2.5 quantile forecas
 5. Simulate inventory outcomes (stockouts, holding) before deploying
 6. Monitor and adjust quantile choice based on realized costs
 
+Operational tips:
+- If shortage cost dwarfs holding (Cu ≫ Co), prefer a higher quantile and consider a conservative seasonal rail; if holding dominates, use a lower quantile and enforce caps.
+- Automate submission validations (row order, column names, zero counts) to avoid last‑mile errors.
+- Keep traditional models (e.g., TBATS/ARIMA) in a separate environment when dependency constraints differ; quantile workflows can coexist during transition.
+
 ## Why This Matters
 
 Quantile forecasts transform predictive uncertainty from a source of risk into a managed input for smarter inventory strategies. Instead of "forecast then add safety stock," you **forecast at the required service/cost level**.
@@ -283,6 +347,8 @@ This ensures inventory levels are neither too lean nor too bloated, but rather a
 **"Inventory planning rewards clarity more than cleverness."**
 
 Quantile forecasts contribute to that clarity by explicitly showing the range of demand outcomes and aligning decisions (service levels, safety stocks) with quantifiable probabilities.
+
+Note on compute: enabling the quantile head adds some overhead (extra output tensor and parameters). If throughput matters, emit only the quantiles you need or limit to critical SKUs. TimesFM 2.5 remains efficient enough for portfolio‑scale use.
 
 ## References
 
