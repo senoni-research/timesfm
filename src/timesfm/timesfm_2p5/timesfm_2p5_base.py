@@ -38,8 +38,12 @@ def strip_leading_nans(arr):
     A new NumPy array with leading NaN values removed.
     If the array is all NaNs or empty, returns an empty array.
   """
-
+  arr = np.asarray(arr, dtype=float)
+  if arr.size == 0:
+    return arr
   isnan = np.isnan(arr)
+  if np.all(isnan):
+    return np.asarray([], dtype=float)
   first_valid_index = np.argmax(~isnan)
   return arr[first_valid_index:]
 
@@ -53,10 +57,12 @@ def linear_interpolation(arr):
   Returns:
       A new numpy array with NaN values filled using linear interpolation,
       or the original array if no NaNs are present.
-      Returns None if the input is not a 1D array.
-      Returns the original array if there are no NaN values.
+      Returns the original array unchanged if it is not 1-D.
   """
-
+  arr = np.asarray(arr, dtype=float)
+  if arr.ndim != 1:
+    return arr  # or raise
+  
   nans = np.isnan(arr)
   if not np.any(nans):  # Check if there are any NaNs
     return arr
@@ -71,8 +77,9 @@ def linear_interpolation(arr):
   try:
     arr[nans] = np.interp(nans_indices, non_nans_indices, non_nans_values)
   except ValueError:
-    if non_nans_values:
-      mu = np.nanmean(arr)
+    # Fix: use .size to check array emptiness, not truthiness
+    if non_nans_values.size > 0:
+      mu = float(np.nanmean(arr))
     else:
       mu = 0.0
     arr = np.where(np.isfinite(arr), arr, mu)
@@ -162,15 +169,22 @@ class TimesFM_2p5:
 
     context = self.forecast_config.max_context
     num_inputs = len(inputs)
+    
+    # Handle empty batch
+    if num_inputs == 0:
+      return np.array([]), np.array([])
+    
+    # Don't mutate caller's inputs - make a copy for padding
+    series = list(inputs)
     if (w := num_inputs % self.global_batch_size) != 0:
-      inputs += [np.array([0.0] * 3)] * (self.global_batch_size - w)
+      series += [np.array([0.0, 0.0, 0.0], dtype=float)] * (self.global_batch_size - w)
 
     output_points = []
     output_quantiles = []
     values = []
     masks = []
     idx = 0
-    for each_input in inputs:
+    for each_input in series:
       value = linear_interpolation(strip_leading_nans(np.array(each_input)))
       if (w := len(value)) >= context:
         value = value[-context:]
@@ -209,7 +223,7 @@ class TimesFM_2p5:
       ridge: float = 0.0,
       max_rows_per_col: int = 0,
       force_on_cpu: bool = False,
-  ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+  ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """Forecasts on a list of time series with covariates.
 
     This method uses external regressors (covariates) to improve forecasting.
@@ -219,34 +233,34 @@ class TimesFM_2p5:
 
     Args:
       horizon: The forecast horizon length.
-      inputs: A list of time series forecast contexts. Each context time series
-        should be convertible to a numpy array.
-      dynamic_numerical_covariates: A dict of dynamic numerical covariates.
-        Each value should be a list of sequences, where each sequence contains
-        covariate values for both context and horizon (context_len + horizon_len).
-      dynamic_categorical_covariates: A dict of dynamic categorical covariates.
-        Similar structure to dynamic_numerical_covariates.
-      static_numerical_covariates: A dict of static numerical covariates.
-        Each value should be a list with one value per input time series.
-      static_categorical_covariates: A dict of static categorical covariates.
-        Each value should be a list with one value per input time series.
-      xreg_mode: one of "xreg + timesfm" or "timesfm + xreg".
-        - "xreg + timesfm": Fit linear model on targets, then forecast residuals.
-        - "timesfm + xreg": Forecast with TimesFM, then fit linear model on residuals.
+      inputs: A list of N time series forecast contexts. Each is a 1D array of length context_len.
+      dynamic_numerical_covariates: A dict mapping covariate names to lists of N sequences,
+        each of length (context_len + horizon).
+      dynamic_categorical_covariates: A dict mapping covariate names to lists of N sequences,
+        each of length (context_len + horizon).
+      static_numerical_covariates: A dict mapping covariate names to lists of N scalars
+        (one per input series).
+      static_categorical_covariates: A dict mapping covariate names to lists of N scalars
+        (one per input series).
+      xreg_mode: one of "xreg + timesfm" (default, recommended) or "timesfm + xreg".
+        - "xreg + timesfm": Fit linear model on targets, then forecast residuals with TimesFM.
+        - "timesfm + xreg": Forecast with TimesFM first, then fit linear model on residuals.
       normalize_xreg_target_per_input: whether to normalize the xreg target per
         input in the given batch.
-      ridge: ridge penalty for the linear model.
-      max_rows_per_col: max number of rows per column for the linear model.
+      ridge: ridge penalty for the linear model (default 0.0).
+      max_rows_per_col: max number of rows per column for the linear model (0 = no limit).
       force_on_cpu: whether to force running on cpu for the linear model.
 
     Returns:
-      A tuple of two lists:
-        - The first list contains the combined forecasts (TimesFM + covariates).
-        - The second list contains the pure linear regression forecasts.
+      A tuple of three elements:
+        - outputs: List of N arrays, each shape (H,), combined point forecasts (TimesFM + covariates).
+        - xregs: List of N arrays, each shape (H,), pure linear regression forecasts on horizon.
+        - quantile_outputs_adjusted: List of N arrays, each shape (H, Q), combined quantile forecasts
+          with xreg adjustments applied across all quantile levels. Empty list if quantile head not enabled.
 
     Raises:
       RuntimeError: If the model is not compiled.
-      ValueError: If no covariates are provided or if horizon exceeds model capacity.
+      ValueError: If no covariates are provided or if covariate lengths mismatch horizon.
     """
     from .. import xreg_lib
 
@@ -263,6 +277,8 @@ class TimesFM_2p5:
 
     # Track the lengths of (1) each input, (2) the part that can be used in the
     # linear model, and (3) the horizon.
+    # Note: train_lens can be 0 for very short series in "timesfm + xreg" mode;
+    # xreg_lib will handle this gracefully (fit will produce zero coefficients).
     input_lens, train_lens, test_lens = [], [], []
     
     # Get patch length from model config
@@ -328,22 +344,33 @@ class TimesFM_2p5:
 
     # Fit models based on the selected mode.
     if xreg_mode == "timesfm + xreg":
-      # Forecast via TimesFM then fit a model on the residuals.
-      mean_outputs, _ = self.forecast(horizon, inputs)
+      # 1) Horizon forecast via TimesFM first
+      mean_outputs, quantile_outputs = self.forecast(horizon, inputs)
       
-      # For residuals, we need the forecast on the context
-      # Since v2.5 doesn't return forecast on context by default, we'll use a simpler approach
-      # We'll fit on the difference between the input and a simple continuation
+      # 2) Build residual targets for xreg fitting
+      # We fit xreg on residuals = actual - naive_continuation over training window
       targets = [
-          np.array(input_ts)[-train_len:]
+          np.asarray(input_ts, dtype=float)[-train_len:]
           for input_ts, train_len in zip(inputs, train_lens)
       ]
+      
+      # Naive continuation baseline: repeat last observed value
+      naive_continuations = []
+      for input_ts, train_len in zip(inputs, train_lens):
+        ts = np.asarray(input_ts, dtype=float)
+        if train_len <= 0 or ts.size == 0 or not np.isfinite(ts[-1]):
+          naive_continuations.append(np.zeros(max(train_len, 0), dtype=float))
+        else:
+          naive_continuations.append(np.full(train_len, ts[-1], dtype=float))
+      
+      residual_targets = [t - n for t, n in zip(targets, naive_continuations)]
+      
       per_instance_stats = None
       if normalize_xreg_target_per_input:
-        targets, per_instance_stats = _normalize(targets)
+        residual_targets, per_instance_stats = _normalize(residual_targets)
       
-      xregs = xreg_lib.BatchedInContextXRegLinear(
-          targets=targets,
+      xregs_residual = xreg_lib.BatchedInContextXRegLinear(
+          targets=residual_targets,
           train_lens=train_lens,
           test_lens=test_lens,
           train_dynamic_numerical_covariates=train_dynamic_numerical_covariates,
@@ -363,12 +390,25 @@ class TimesFM_2p5:
           assert_covariates=True,
           assert_covariate_shapes=True,
       )
+      
+      # xreg predicts residuals on horizon; add on top of TimesFM
+      xregs = xregs_residual
       if normalize_xreg_target_per_input:
         xregs = _renormalize(xregs, per_instance_stats)
+      
       outputs = [
           mean_output + xreg
           for mean_output, xreg in zip(mean_outputs, xregs)
       ]
+      
+      # Apply xreg adjustments to all quantiles with shape guards
+      quantile_outputs_adjusted = []
+      for quantile_output, xreg in zip(quantile_outputs, xregs):
+        # Shape assertions
+        assert quantile_output.ndim == 2, f"quantile_output expected (H, Q), got shape {quantile_output.shape}"
+        assert xreg.ndim == 1 and xreg.shape[0] == quantile_output.shape[0], \
+            f"xreg expected (H,), got shape {xreg.shape}, quantile_output is {quantile_output.shape}"
+        quantile_outputs_adjusted.append(quantile_output + xreg[:, np.newaxis])  # Broadcast across quantiles
 
     else:  # xreg_mode == "xreg + timesfm"
       # Fit a model on the targets then forecast on the residuals via TimesFM.
@@ -397,7 +437,7 @@ class TimesFM_2p5:
           one_hot_encoder_drop=None if ridge > 0 else "first",
           max_rows_per_col=max_rows_per_col,
           force_on_cpu=force_on_cpu,
-          debug_info=True,
+          debug_info=True,  # Need debug_info=True to get xregs_on_context
           assert_covariates=True,
           assert_covariate_shapes=True,
       )
@@ -407,16 +447,37 @@ class TimesFM_2p5:
           target - xreg_on_context
           for target, xreg_on_context in zip(targets, xregs_on_context)
       ]
-      mean_outputs, _ = self.forecast(horizon, residuals)
+      mean_outputs, quantile_outputs = self.forecast(horizon, residuals)
       
       outputs = [
           mean_output + xreg
           for mean_output, xreg in zip(mean_outputs, xregs)
       ]
+      
+      # Apply xreg adjustments to all quantiles with shape guards
+      quantile_outputs_adjusted = []
+      for quantile_output, xreg in zip(quantile_outputs, xregs):
+        # Shape assertions
+        assert quantile_output.ndim == 2, f"quantile_output expected (H, Q), got shape {quantile_output.shape}"
+        assert xreg.ndim == 1 and xreg.shape[0] == quantile_output.shape[0], \
+            f"xreg expected (H,), got shape {xreg.shape}, quantile_output is {quantile_output.shape}"
+        quantile_outputs_adjusted.append(quantile_output + xreg[:, np.newaxis])  # Broadcast across quantiles
+      
+      # Renormalize both point and quantile outputs if normalization was applied
       if normalize_xreg_target_per_input:
         outputs = _renormalize(outputs, per_instance_stats)
+        # Renormalize quantiles as well (they were in normalized space)
+        quantile_outputs_adjusted = [
+            _renormalize([q], [stat])[0]
+            for q, stat in zip(quantile_outputs_adjusted, per_instance_stats)
+        ]
+    
+    # Apply positivity constraint if enabled
+    if getattr(self.forecast_config, "infer_is_positive", False):
+      outputs = [np.maximum(0.0, o) for o in outputs]
+      quantile_outputs_adjusted = [np.maximum(0.0, q) for q in quantile_outputs_adjusted]
 
-    return outputs, xregs
+    return outputs, xregs, quantile_outputs_adjusted
 
 
 def _normalize(targets: list[np.ndarray]) -> tuple[list[np.ndarray], list[dict]]:
@@ -432,9 +493,14 @@ def _normalize(targets: list[np.ndarray]) -> tuple[list[np.ndarray], list[dict]]
   normalized = []
   stats = []
   for target in targets:
-    arr = np.array(target)
-    mean = np.mean(arr)
-    std = np.std(arr)
+    arr = np.asarray(target, dtype=float)
+    # Guard against empty or all-invalid arrays
+    if arr.size == 0 or not np.isfinite(arr).any():
+      normalized.append(np.zeros_like(arr, dtype=float))
+      stats.append({"mean": 0.0, "std": 1.0})
+      continue
+    mean = float(np.mean(arr))
+    std = float(np.std(arr))
     if std < 1e-6:
       std = 1.0
     normalized.append((arr - mean) / std)
